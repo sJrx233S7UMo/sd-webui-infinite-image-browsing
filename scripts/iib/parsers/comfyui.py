@@ -30,9 +30,15 @@ class ComfyUIParser:
             else:
                 params = get_comfyui_exif_data(img)
                 info = comfyui_exif_data_to_str(params)
-        except Exception:                        
-            logger.error('parse comfyui image failed. prompt:')
-            logger.error(img.info.get('prompt'))
+        except Exception as e:
+            logger.error('parse comfyui image failed. filepath:')
+            logger.error(file_path)
+            if img.info.get('prompt'):
+                logger.error('prompt:')
+                logger.error(img.info.get('prompt'))
+            if img.info.get('exif'):
+                logger.error('exif:')
+                logger.error(img.info.get('exif'))
             return ImageGenerationInfo()
         return ImageGenerationInfo(
             info,
@@ -44,8 +50,6 @@ class ComfyUIParser:
     @classmethod
     def test(clz, img: Image, file_path: str) -> bool:
         try:
-            return is_img_created_by_comfyui(
-                img
-            ) or is_img_created_by_comfyui_with_webui_gen_info(img)
+            return is_img_created_by_comfyui(img) or is_img_created_by_comfyui_with_webui_gen_info(img)
         except Exception:
             return False

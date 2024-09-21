@@ -11,6 +11,7 @@ import piexif
 import piexif.helper
 import json
 import zipfile
+import struct
 from PIL import Image
 import shutil
 
@@ -393,18 +394,84 @@ def get_img_geninfo_txt_path(path: str):
     if os.path.exists(txt_path):
         return txt_path
 
+
+def parse_exif_data(exif_data):
+    # Check for the correct TIFF header (0x4949 for little-endian or 0x4D4D for big-endian)
+    is_little_endian = struct.unpack("<H", exif_data[:2])[0] == 0x4949
+
+    # Function to read 16-bit and 32-bit integers from binary data
+    def read_int(offset, length):
+        fmt = "<H" if is_little_endian else ">H" if length == 2 else "<I" if is_little_endian else ">I"
+        return struct.unpack(fmt, exif_data[offset:offset + length])[0]
+
+    # Read the offset to the first IFD (Image File Directory)
+    ifd_offset = read_int(4, 4)
+
+    def parse_ifd(offset):
+        num_entries = read_int(offset, 2)
+        result = {}
+
+        for i in range(num_entries):
+            entry_offset = offset + 2 + i * 12
+            tag = read_int(entry_offset, 2)
+            type_ = read_int(entry_offset + 2, 2)
+            num_values = read_int(entry_offset + 4, 4)
+            value_offset = read_int(entry_offset + 8, 4)
+
+            # Read the value(s) based on the data type
+            value = None
+            if type_ == 2:  # ASCII string
+                value = exif_data[value_offset:value_offset + num_values - 1].decode('ascii')
+
+            result[tag] = value
+
+        return result
+
+    # Parse the first IFD
+    ifd_data = parse_ifd(ifd_offset)
+    return ifd_data
+
 def is_img_created_by_comfyui(img: Image):
-    return img.info.get('prompt') and img.info.get('workflow')
+    metadata = get_comfyui_metadata(img)
+    return 'prompt' in metadata and 'workflow' in metadata
 
 def is_img_created_by_comfyui_with_webui_gen_info(img: Image):
-    return is_img_created_by_comfyui(img) and img.info.get('parameters')
+    metadata = get_comfyui_metadata(img)
+    return 'prompt' in metadata and 'workflow' in metadata and 'parameters' in metadata
+
+def get_comfyui_metadata(img: Image):
+    if img.info.get('prompt') and img.info.get('workflow'):
+        if img.info.get('parameters'):
+            return { 'prompt': img.info['prompt'], 'workflow': img.info['workflow'], 'parameters': img.info['parameters'] }
+        else:
+            return { 'prompt': img.info['prompt'], 'workflow': img.info['workflow'] }
+    # Check if EXIF data exists
+    if img.info.get('exif'):
+        try:
+            exif = parse_exif_data(img.info['exif'])
+            # Extract the UserComment field
+            exif_comment = exif.get(37510, b"")
+            if exif_comment:
+                # Try decoding and loading as JSON
+                metadata = json.loads(exif_comment)
+                return metadata
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return {}
+
 
 def get_comfyui_exif_data(img: Image):
-    prompt = img.info.get('prompt')
-    if not prompt:
+    metadata = get_comfyui_metadata(img)
+
+    if not 'prompt' in metadata:
         return {}
+
+    prompt = metadata['prompt']
+ 
+    if isinstance(prompt, str):
+      prompt = json.loads(prompt)
+
     meta_key = '3'
-    data: Dict[str, any] = json.loads(prompt)
+    data: Dict[str, any] = prompt
     for i in range(3, 32):
         try:
             i = str(i)
@@ -417,15 +484,31 @@ def get_comfyui_exif_data(img: Image):
     KSampler_entry = data[meta_key]["inputs"]
     # As a workaround to bypass parsing errors in the parser.
     # https://github.com/jiw0220/stable-diffusion-image-metadata/blob/00b8d42d4d1a536862bba0b07c332bdebb2a0ce5/src/index.ts#L130
-    meta["Steps"] = "Unknown" 
+    meta["Steps"] = "Unknown"
     meta["Sampler"] = KSampler_entry["sampler_name"]
-    meta["Model"] = data[KSampler_entry["model"][0]]["inputs"]["ckpt_name"]
+    def get_Model(idx: str):
+        if "ckpt_name" in data[idx]["inputs"]:
+            return data[idx]["inputs"]["ckpt_name"]
+        elif "model" in data[idx]["inputs"]:
+            return get_Model(data[idx]["inputs"]["model"][0])
+        else:
+            return "Unknown"
+    meta["Model"] = get_Model(KSampler_entry["model"][0])
     meta["Source Identifier"] = "ComfyUI"
-    def get_text_from_clip(idx: str) :
-        text = data[idx]["inputs"]["text"]
-        if isinstance(text, list): # type:CLIPTextEncode (NSP) mode:Wildcards
-            text = data[text[0]]["inputs"]["text"]
-        return text.strip()
+    def get_text_from_clip(idx: str):
+        inputs = data[idx]["inputs"]
+        if "text" in inputs:
+          text = inputs["text"]
+          if isinstance(text, list): # type:CLIPTextEncode (NSP) mode:Wildcards
+              text = data[text[0]]["inputs"]["text"]
+          return text.strip()
+        # conditioning combine
+        elif "conditioning_1" in inputs and "conditioning_2" in inputs:
+          c1 = get_text_from_clip(inputs["conditioning_1"][0])
+          c2 = get_text_from_clip(inputs["conditioning_2"][0])
+          return "\n BREAK \n".join(filter(None, [c1, c2]))
+        else:
+          return ""
     pos_prompt = get_text_from_clip(KSampler_entry["positive"][0])
     neg_prompt = get_text_from_clip(KSampler_entry["negative"][0])
     pos_prompt_arr = unique_by(parse_prompt(pos_prompt)["pos_prompt"])
